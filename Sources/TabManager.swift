@@ -646,6 +646,7 @@ class TabManager: ObservableObject {
     weak var window: NSWindow?
 
     @Published var tabs: [Workspace] = []
+    @Published private(set) var broadcastInputWorkspaceIds: Set<UUID> = []
     @Published private(set) var isWorkspaceCycleHot: Bool = false
     @Published private(set) var pendingBackgroundWorkspaceLoadIds: Set<UUID> = []
     @Published private(set) var debugPinnedWorkspaceLoadIds: Set<UUID> = []
@@ -821,6 +822,31 @@ class TabManager: ObservableObject {
         workspace.onClosedBrowserPanel = nil
     }
 
+    private func wireTerminalInputBroadcast(for workspace: Workspace) {
+        workspace.onTerminalPanelRegistered = { [weak self, weak workspace] terminalPanel in
+            guard let self, let workspace else { return }
+            terminalPanel.setInputBroadcastRelay { [weak self, weak workspace, weak terminalPanel] payload in
+                guard let self, let workspace, let terminalPanel else { return }
+                self.broadcastTerminalInputIfEnabled(
+                    in: workspace.id,
+                    from: terminalPanel.id,
+                    payload: payload
+                )
+            }
+        }
+
+        for terminalPanel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+            workspace.bindTerminalInputRelayIfNeeded(terminalPanel)
+        }
+    }
+
+    private func unwireTerminalInputBroadcast(for workspace: Workspace) {
+        workspace.onTerminalPanelRegistered = nil
+        for terminalPanel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+            terminalPanel.setInputBroadcastRelay(nil)
+        }
+    }
+
     var selectedWorkspace: Workspace? {
         guard let selectedTabId else { return nil }
         return tabs.first(where: { $0.id == selectedTabId })
@@ -839,6 +865,11 @@ class TabManager: ObservableObject {
     /// Returns the focused panel's terminal panel (if it is a terminal)
     var selectedTerminalPanel: TerminalPanel? {
         selectedWorkspace?.focusedTerminalPanel
+    }
+
+    var isSelectedWorkspaceInputBroadcastEnabled: Bool {
+        guard let workspaceId = selectedWorkspace?.id else { return false }
+        return broadcastInputWorkspaceIds.contains(workspaceId)
     }
 
     var isFindVisible: Bool {
@@ -908,6 +939,38 @@ class TabManager: ObservableObject {
         return panel.surface.toggleKeyboardCopyMode()
     }
 
+    func isBroadcastInputEnabled(for workspaceId: UUID) -> Bool {
+        broadcastInputWorkspaceIds.contains(workspaceId)
+    }
+
+    func setBroadcastInputEnabled(_ enabled: Bool, for workspaceId: UUID) {
+        if enabled {
+            broadcastInputWorkspaceIds.insert(workspaceId)
+        } else {
+            broadcastInputWorkspaceIds.remove(workspaceId)
+        }
+    }
+
+    @discardableResult
+    func toggleSelectedWorkspaceInputBroadcast() -> Bool {
+        guard let workspaceId = selectedWorkspace?.id else { return false }
+        let next = !isBroadcastInputEnabled(for: workspaceId)
+        setBroadcastInputEnabled(next, for: workspaceId)
+        return true
+    }
+
+    func broadcastTerminalInputIfEnabled(
+        in workspaceId: UUID,
+        from sourcePanelId: UUID,
+        payload: TerminalBroadcastInputPayload
+    ) {
+        guard broadcastInputWorkspaceIds.contains(workspaceId),
+              let workspace = tabs.first(where: { $0.id == workspaceId }) else {
+            return
+        }
+        workspace.broadcastTerminalInput(payload, from: sourcePanelId)
+    }
+
     func hideFind() {
         if let browser = focusedBrowserPanel, browser.searchState != nil {
             browser.hideFind()
@@ -941,6 +1004,7 @@ class TabManager: ObservableObject {
         )
         newWorkspace.owningTabManager = self
         wireClosedBrowserTracking(for: newWorkspace)
+        wireTerminalInputBroadcast(for: newWorkspace)
         let insertIndex = newTabInsertIndex(placementOverride: placementOverride)
         if insertIndex >= 0 && insertIndex <= tabs.count {
             tabs.insert(newWorkspace, at: insertIndex)
@@ -1392,6 +1456,8 @@ class TabManager: ObservableObject {
         unwireClosedBrowserTracking(for: workspace)
         workspace.teardownAllPanels()
         workspace.owningTabManager = nil
+        unwireTerminalInputBroadcast(for: workspace)
+        broadcastInputWorkspaceIds.remove(workspace.id)
 
         tabs.remove(at: index)
 
@@ -1415,7 +1481,9 @@ class TabManager: ObservableObject {
         let removed = tabs.remove(at: index)
         unwireClosedBrowserTracking(for: removed)
         removed.owningTabManager = nil
+        unwireTerminalInputBroadcast(for: removed)
         lastFocusedPanelByTab.removeValue(forKey: removed.id)
+        broadcastInputWorkspaceIds.remove(removed.id)
 
         if tabs.isEmpty {
             // The UI assumes each window always has at least one workspace.
@@ -1435,6 +1503,7 @@ class TabManager: ObservableObject {
     func attachWorkspace(_ workspace: Workspace, at index: Int? = nil, select: Bool = true) {
         workspace.owningTabManager = self
         wireClosedBrowserTracking(for: workspace)
+        wireTerminalInputBroadcast(for: workspace)
         let insertIndex: Int = {
             guard let index else { return tabs.count }
             return max(0, min(index, tabs.count))
@@ -4035,6 +4104,7 @@ extension TabManager {
     func restoreSessionSnapshot(_ snapshot: SessionTabManagerSnapshot) {
         for tab in tabs {
             unwireClosedBrowserTracking(for: tab)
+            unwireTerminalInputBroadcast(for: tab)
         }
 
         // Clear non-@Published state without touching tabs/selectedTabId yet.
@@ -4049,6 +4119,7 @@ extension TabManager {
         isWorkspaceCycleHot = false
         selectionSideEffectsGeneration &+= 1
         recentlyClosedBrowsers = RecentlyClosedBrowserStack(capacity: 20)
+        broadcastInputWorkspaceIds.removeAll()
 
         // Build the new workspace list locally to avoid intermediate @Published
         // emissions (empty tabs, nil selectedTabId) that can leave SwiftUI's
@@ -4067,6 +4138,7 @@ extension TabManager {
             workspace.owningTabManager = self
             workspace.restoreSessionSnapshot(workspaceSnapshot)
             wireClosedBrowserTracking(for: workspace)
+            wireTerminalInputBroadcast(for: workspace)
             newTabs.append(workspace)
         }
 
@@ -4076,6 +4148,7 @@ extension TabManager {
             let fallback = Workspace(title: "Terminal 1", portOrdinal: ordinal)
             fallback.owningTabManager = self
             wireClosedBrowserTracking(for: fallback)
+            wireTerminalInputBroadcast(for: fallback)
             newTabs.append(fallback)
         }
 
