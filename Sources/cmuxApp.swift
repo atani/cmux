@@ -622,7 +622,7 @@ struct cmuxApp: App {
 
                 Divider()
 
-                splitCommandToggle(
+                commandToggle(
                     title: String(localized: "menu.view.broadcastInput", defaultValue: "Broadcast Input to All Panes"),
                     shortcut: toggleWorkspaceInputBroadcastMenuShortcut,
                     isOn: selectedWorkspaceBroadcastInputBinding(in: activeTabManager)
@@ -1062,7 +1062,7 @@ struct cmuxApp: App {
     }
 
     @ViewBuilder
-    private func splitCommandToggle(title: String, shortcut: StoredShortcut, isOn: Binding<Bool>) -> some View {
+    private func commandToggle(title: String, shortcut: StoredShortcut, isOn: Binding<Bool>) -> some View {
         if let key = shortcut.keyEquivalent {
             Toggle(title, isOn: isOn)
                 .keyboardShortcut(key, modifiers: shortcut.eventModifiers)

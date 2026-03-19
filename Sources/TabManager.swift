@@ -823,8 +823,10 @@ class TabManager: ObservableObject {
     }
 
     private func wireTerminalInputBroadcast(for workspace: Workspace) {
+        let isActive = broadcastInputWorkspaceIds.contains(workspace.id)
         workspace.onTerminalPanelRegistered = { [weak self, weak workspace] terminalPanel in
             guard let self, let workspace else { return }
+            terminalPanel.surface.isBroadcastActive = self.broadcastInputWorkspaceIds.contains(workspace.id)
             terminalPanel.setInputBroadcastRelay { [weak self, weak workspace, weak terminalPanel] payload in
                 guard let self, let workspace, let terminalPanel else { return }
                 self.broadcastTerminalInputIfEnabled(
@@ -836,6 +838,7 @@ class TabManager: ObservableObject {
         }
 
         for terminalPanel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+            terminalPanel.surface.isBroadcastActive = isActive
             workspace.bindTerminalInputRelayIfNeeded(terminalPanel)
         }
     }
@@ -843,6 +846,7 @@ class TabManager: ObservableObject {
     private func unwireTerminalInputBroadcast(for workspace: Workspace) {
         workspace.onTerminalPanelRegistered = nil
         for terminalPanel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+            terminalPanel.surface.isBroadcastActive = false
             terminalPanel.setInputBroadcastRelay(nil)
         }
     }
@@ -949,13 +953,20 @@ class TabManager: ObservableObject {
         } else {
             broadcastInputWorkspaceIds.remove(workspaceId)
         }
+        // Update the fast isBroadcastActive flag on each terminal surface so
+        // the per-keystroke hot path can skip broadcast without a closure call.
+        if let workspace = tabs.first(where: { $0.id == workspaceId }) {
+            for panel in workspace.panels.values.compactMap({ $0 as? TerminalPanel }) {
+                panel.surface.isBroadcastActive = enabled
+            }
+        }
     }
 
     @discardableResult
     func toggleSelectedWorkspaceInputBroadcast() -> Bool {
         guard let workspaceId = selectedWorkspace?.id else { return false }
-        let next = !isBroadcastInputEnabled(for: workspaceId)
-        setBroadcastInputEnabled(next, for: workspaceId)
+        let shouldEnable = !isBroadcastInputEnabled(for: workspaceId)
+        setBroadcastInputEnabled(shouldEnable, for: workspaceId)
         return true
     }
 

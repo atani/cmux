@@ -2516,6 +2516,33 @@ struct TerminalBroadcastInputPayload {
         self.forceRefreshAfterSend = forceRefreshAfterSend
     }
 
+    /// Convenience initializer that extracts fields from a ghostty_input_key_s C struct.
+    init(keyEvent: ghostty_input_key_s, text: String?, forceRefreshAfterSend: Bool) {
+        self.delivery = .key
+        self.action = keyEvent.action
+        self.keycode = keyEvent.keycode
+        self.mods = keyEvent.mods
+        self.consumedMods = keyEvent.consumed_mods
+        self.composing = keyEvent.composing
+        self.unshiftedCodepoint = keyEvent.unshifted_codepoint
+        self.text = text
+        self.forceRefreshAfterSend = forceRefreshAfterSend
+    }
+
+    static func textPayload(_ text: String) -> TerminalBroadcastInputPayload {
+        TerminalBroadcastInputPayload(
+            delivery: .text,
+            action: GHOSTTY_ACTION_PRESS,
+            keycode: 0,
+            mods: GHOSTTY_MODS_NONE,
+            consumedMods: GHOSTTY_MODS_NONE,
+            composing: false,
+            unshiftedCodepoint: 0,
+            text: text,
+            forceRefreshAfterSend: false
+        )
+    }
+
     fileprivate func send(to surface: ghostty_surface_t) -> Bool {
         switch delivery {
         case .text:
@@ -2598,7 +2625,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var pendingTextQueue: [Data] = []
     private var pendingTextBytes: Int = 0
     private let maxPendingTextBytes = 1_048_576
-    private var inputBroadcastRelay: ((TerminalBroadcastInputPayload) -> Void)?
+    /// Relay closure for broadcasting input to peer panes. Callers must use weak
+    /// captures to avoid retain cycles between TabManager, Workspace, and TerminalPanel.
+    private(set) var inputBroadcastRelay: ((TerminalBroadcastInputPayload) -> Void)?
+    /// Fast flag checked on every keystroke to skip broadcast payload construction.
+    /// Toggled by TabManager when broadcast state changes for this surface's workspace.
+    var isBroadcastActive: Bool = false
     private var backgroundSurfaceStartQueued = false
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
     private enum PortalLifecycleState: String {
@@ -3359,19 +3391,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     func broadcastTextToPeers(_ text: String) {
-        inputBroadcastRelay?(
-            TerminalBroadcastInputPayload(
-                delivery: .text,
-                action: GHOSTTY_ACTION_PRESS,
-                keycode: 0,
-                mods: GHOSTTY_MODS_NONE,
-                consumedMods: GHOSTTY_MODS_NONE,
-                composing: false,
-                unshiftedCodepoint: 0,
-                text: text,
-                forceRefreshAfterSend: false
-            )
-        )
+        inputBroadcastRelay?(.textPayload(text))
     }
 
     func sendBroadcastInput(_ payload: TerminalBroadcastInputPayload) {
@@ -3380,22 +3400,6 @@ final class TerminalSurface: Identifiable, ObservableObject {
         if payload.forceRefreshAfterSend {
             forceRefresh(reason: "broadcast.textInput")
         }
-    }
-
-    func sendBroadcastText(_ text: String) {
-        sendBroadcastInput(
-            TerminalBroadcastInputPayload(
-                delivery: .text,
-                action: GHOSTTY_ACTION_PRESS,
-                keycode: 0,
-                mods: GHOSTTY_MODS_NONE,
-                consumedMods: GHOSTTY_MODS_NONE,
-                composing: false,
-                unshiftedCodepoint: 0,
-                text: text,
-                forceRefreshAfterSend: false
-            )
-        )
     }
 
     func sendText(_ text: String) {
@@ -4394,16 +4398,14 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     // MARK: - Clipboard paste
 
     @IBAction func paste(_ sender: Any?) {
-        if !pasteClipboardContentsIntoSurfaceAndPeers() {
-            _ = performBindingAction("paste_from_clipboard")
-        }
+        _ = performBindingAction("paste_from_clipboard")
+        broadcastClipboardToPeersIfNeeded()
     }
 
     /// Pastes clipboard text as plain text, stripping any rich formatting.
     @IBAction func pasteAsPlainText(_ sender: Any?) {
-        if !pasteClipboardContentsIntoSurfaceAndPeers() {
-            _ = performBindingAction("paste_from_clipboard")
-        }
+        _ = performBindingAction("paste_from_clipboard")
+        broadcastClipboardToPeersIfNeeded()
     }
 
     /// Validates whether edit menu items (copy, paste, split) should be enabled.
@@ -4910,18 +4912,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             // If not (e.g. `ignore` keybind), fall through to interpretKeyEvents
             // so the IME gets a chance to process this event.
             if handled {
-                broadcastInputIfNeeded(
-                    TerminalBroadcastInputPayload(
-                        action: keyEvent.action,
-                        keycode: keyEvent.keycode,
-                        mods: keyEvent.mods,
-                        consumedMods: keyEvent.consumed_mods,
-                        composing: keyEvent.composing,
-                        unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                        text: text.isEmpty ? nil : text,
-                        forceRefreshAfterSend: false
-                    )
-                )
+                broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: text.isEmpty ? nil : text, forceRefreshAfterSend: false))
                 return
             }
         }
@@ -5061,18 +5052,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                         keyEvent.text = ptr
                         _ = ghostty_surface_key(surface, keyEvent)
                     }
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: text,
-                            forceRefreshAfterSend: true
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: text, forceRefreshAfterSend: true))
 #if DEBUG
                     ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
                     CmuxTypingTiming.logDuration(
@@ -5092,33 +5072,11 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                         path: "terminal.keyDown.accumulatedGhosttySend",
                         event: event
                     )
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
                     ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
                     #else
                     _ = ghostty_surface_key(surface, keyEvent)
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
                     #endif
                 }
             }
@@ -5142,18 +5100,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                         keyEvent.text = ptr
                         _ = ghostty_surface_key(surface, keyEvent)
                     }
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: text,
-                            forceRefreshAfterSend: true
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: text, forceRefreshAfterSend: true))
 #if DEBUG
                     ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
                     CmuxTypingTiming.logDuration(
@@ -5173,73 +5120,29 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
                         path: "terminal.keyDown.ghosttySend",
                         event: event
                     )
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
                     ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
                     #else
                     _ = ghostty_surface_key(surface, keyEvent)
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
+                    broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
                     #endif
                 }
             } else {
                 keyEvent.text = nil
                 #if DEBUG
                 let ghosttySendStart = ProcessInfo.processInfo.systemUptime
-                    _ = sendTimedGhosttyKey(
-                        surface,
-                        keyEvent,
-                        path: "terminal.keyDown.ghosttySend",
-                        event: event
-                    )
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
-                    ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
-                    #else
-                    _ = ghostty_surface_key(surface, keyEvent)
-                    broadcastInputIfNeeded(
-                        TerminalBroadcastInputPayload(
-                            action: keyEvent.action,
-                            keycode: keyEvent.keycode,
-                            mods: keyEvent.mods,
-                            consumedMods: keyEvent.consumed_mods,
-                            composing: keyEvent.composing,
-                            unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                            text: nil,
-                            forceRefreshAfterSend: false
-                        )
-                    )
-                    #endif
+                _ = sendTimedGhosttyKey(
+                    surface,
+                    keyEvent,
+                    path: "terminal.keyDown.ghosttySend",
+                    event: event
+                )
+                broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
+                ghosttySendMs += (ProcessInfo.processInfo.systemUptime - ghosttySendStart) * 1000.0
+                #else
+                _ = ghostty_surface_key(surface, keyEvent)
+                broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
+                #endif
             }
         }
 
@@ -5257,6 +5160,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     }
 
     private func broadcastInputIfNeeded(_ payload: TerminalBroadcastInputPayload) {
+        guard terminalSurface?.isBroadcastActive == true else { return }
         terminalSurface?.broadcastInputToPeers(payload)
     }
 
@@ -5319,18 +5223,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         keyEvent.text = nil
         keyEvent.composing = false
         _ = sendGhosttyKey(surface, keyEvent)
-        broadcastInputIfNeeded(
-            TerminalBroadcastInputPayload(
-                action: keyEvent.action,
-                keycode: keyEvent.keycode,
-                mods: keyEvent.mods,
-                consumedMods: keyEvent.consumed_mods,
-                composing: keyEvent.composing,
-                unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                text: nil,
-                forceRefreshAfterSend: false
-            )
-        )
+        broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -5347,18 +5240,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         keyEvent.text = nil
         keyEvent.composing = false
         _ = ghostty_surface_key(surface, keyEvent)
-        broadcastInputIfNeeded(
-            TerminalBroadcastInputPayload(
-                action: keyEvent.action,
-                keycode: keyEvent.keycode,
-                mods: keyEvent.mods,
-                consumedMods: keyEvent.consumed_mods,
-                composing: keyEvent.composing,
-                unshiftedCodepoint: keyEvent.unshifted_codepoint,
-                text: nil,
-                forceRefreshAfterSend: false
-            )
-        )
+        broadcastInputIfNeeded(.init(keyEvent: keyEvent, text: nil, forceRefreshAfterSend: false))
     }
 
     private func modsFromEvent(_ event: NSEvent) -> ghostty_input_mods_e {
@@ -5908,15 +5790,17 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         terminalSurface?.broadcastTextToPeers(text)
     }
 
-    private func pasteClipboardContentsIntoSurfaceAndPeers() -> Bool {
+    /// Broadcasts clipboard contents to peer panes only (source pane uses Ghostty's
+    /// paste_from_clipboard which handles bracketed paste and confirmation).
+    private func broadcastClipboardToPeersIfNeeded() {
+        guard terminalSurface?.isBroadcastActive == true else { return }
         let pasteboard = GhosttyPasteboardHelper.pasteboard(for: GHOSTTY_CLIPBOARD_STANDARD)
         var value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
         if value.isEmpty, let imagePath = GhosttyPasteboardHelper.saveClipboardImageIfNeeded() {
             value = imagePath
         }
-        guard !value.isEmpty else { return false }
-        sendTextToSurfaceAndPeers(value)
-        return true
+        guard !value.isEmpty else { return }
+        terminalSurface?.broadcastTextToPeers(value)
     }
 
 #if DEBUG
@@ -8281,18 +8165,7 @@ extension GhosttyNSView: NSTextInputClient {
             keyEvent.composing = false
             _ = ghostty_surface_key(surface, keyEvent)
         }
-        terminalSurface?.broadcastInputToPeers(
-            TerminalBroadcastInputPayload(
-                action: GHOSTTY_ACTION_PRESS,
-                keycode: 0,
-                mods: GHOSTTY_MODS_NONE,
-                consumedMods: GHOSTTY_MODS_NONE,
-                composing: false,
-                unshiftedCodepoint: 0,
-                text: chars,
-                forceRefreshAfterSend: false
-            )
-        )
+        terminalSurface?.broadcastTextToPeers(chars)
 #if DEBUG
         CmuxTypingTiming.logDuration(
             path: "terminal.sendTextToSurface",
